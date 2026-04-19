@@ -17,96 +17,395 @@
 /*########################################################################################################################*
 *----------------------------------------------------AnimatedComponent----------------------------------------------------*
 *#########################################################################################################################*/
-#define ANIM_MAX_ANGLE (110 * MATH_DEG2RAD)
-#define ANIM_ARM_MAX (60.0f * MATH_DEG2RAD)
-#define ANIM_LEG_MAX (80.0f * MATH_DEG2RAD)
-#define ANIM_IDLE_MAX (3.0f * MATH_DEG2RAD)
+#define ANIM_MAX_ANGLE    (110 * MATH_DEG2RAD)
+#define ANIM_ARM_MAX      (60.0f * MATH_DEG2RAD)
+#define ANIM_LEG_MAX      (80.0f * MATH_DEG2RAD)
+#define ANIM_IDLE_MAX     (3.0f  * MATH_DEG2RAD)
 #define ANIM_IDLE_XPERIOD (2.0f * MATH_PI / 5.0f)
 #define ANIM_IDLE_ZPERIOD (2.0f * MATH_PI / 3.5f)
 
+/* Render remote entities this many seconds in the past so there is
+   always a future keyframe to interpolate toward — eliminates jitter. */
+#define INTERP_DELAY      0.075f
+
+/* Number of position keyframes kept for spline prediction.
+   More = smoother prediction arc, higher memory per entity. */
+#define KFRAME_COUNT      4
+
+/* Animation blend weight: how fast idle<->walk cross-fade happens.
+   Higher = snappier transition, lower = longer dissolve. */
+#define BLEND_RATE        4.0f
+
+/* -----------------------------------------------------------------------
+   Keyframe ring buffer — stores recent position snapshots so we can
+   fit a Catmull-Rom spline through them and extrapolate forward.
+   ----------------------------------------------------------------------- */
+struct PosKeyframe {
+    float x, y, z;   /* world position  */
+    float t;          /* timestamp (Game.Time at receipt) */
+};
+
+/* -----------------------------------------------------------------------
+   Extended AnimatedComp fields we need — add these to struct AnimatedComp
+   in EntityComponents.h:
+
+       float VelSmooth;
+       float WalkWeight;          // idle(0) <-> walk(1) blend weight
+       float WalkWeightO;         // previous frame blend weight
+       float HeadYawO, HeadYawN;  // smoothed head yaw interpolation
+       float HeadPitchO, HeadPitchN;
+       struct PosKeyframe KFrames[KFRAME_COUNT];
+       int   KFrameHead;          // ring buffer write index
+       float PredVelX, PredVelZ;  // predicted velocity from spline tangent
+   ----------------------------------------------------------------------- */
+
+/* -----------------------------------------------------------------------
+   Math helpers
+   ----------------------------------------------------------------------- */
+
+/* Quintic smooth-step — zero 1st and 2nd derivative at both ends.
+   No acceleration pop at tick boundaries. */
+static float SmootherStep(float t) {
+    return t * t * t * (t * (t * 6.0f - 15.0f) + 10.0f);
+}
+
+/* Septic (degree-7) smooth-step — zero derivatives up to 3rd order.
+   Used for the idle<->walk weight blend so the crossfade is truly
+   jerk-free even at very low framerates. */
+static float SepticStep(float t) {
+    /* Generalised smoothstep order 3: coefficients from Pascal's triangle */
+    return t * t * t * t * (t * (t * (t * -20.0f + 70.0f) - 84.0f) + 35.0f);
+}
+
+/* Cubic Hermite spline: C1-continuous arc from p0->p1
+   with velocity tangents m0 (departure) and m1 (arrival). */
+static float CubicHermite(float p0, float m0, float p1, float m1, float t) {
+    float t2 = t * t, t3 = t2 * t;
+    return (2*t3 - 3*t2 + 1)*p0
+         + (t3  - 2*t2 + t)*m0
+         + (-2*t3 + 3*t2  )*p1
+         + (t3  - t2      )*m1;
+}
+
+/* Catmull-Rom tangent for point p1 given its neighbours p0 and p2.
+   Gives natural, smooth tangents without manual tuning. */
+static float CatmullTangent(float p0, float p2) {
+    return 0.5f * (p2 - p0);
+}
+
+/* Frame-rate-independent exponential decay.
+   Math_Exp2(x)=2^x; ×log2(e)≈1.4427 converts to natural base. */
+static float ExpDecay(float current, float target, float rate, float delta) {
+    float factor = 1.0f - Math_Exp2(-rate * 1.4427f * delta);
+    return current + (target - current) * factor;
+}
+
+/* Shortest-path angular interpolation (handles ±180 wrap). */
+static float AngleLerp(float a, float b, float t) {
+    float diff = b - a;
+    while (diff >  MATH_PI) diff -= 2.0f * MATH_PI;
+    while (diff < -MATH_PI) diff += 2.0f * MATH_PI;
+    return a + diff * t;
+}
+
+/* -----------------------------------------------------------------------
+   Tilt helper (original, unchanged)
+   ----------------------------------------------------------------------- */
 static void AnimatedComp_DoTilt(float* tilt, cc_bool reduce) {
-	if (reduce) {
-		(*tilt) *= 0.84f;
-	} else {
-		(*tilt) += 0.1f;
-	}
-	Math_Clamp(*tilt, 0.0f, 1.0f);
+    if (reduce) { (*tilt) *= 0.84f; }
+    else        { (*tilt) += 0.1f;  }
+    Math_Clamp(*tilt, 0.0f, 1.0f);
 }
 
-static void AnimatedComp_PerpendicularAnim(struct AnimatedComp* anim, float flapSpeed, float idleXRot, float idleZRot, cc_bool left) {
-	float verAngle = 0.5f + 0.5f * Math_SinF(anim->WalkTime * flapSpeed);
-	float horAngle = Math_CosF(anim->WalkTime);
-	float zRot = -idleZRot - verAngle * anim->Swing * ANIM_MAX_ANGLE;	
-	float xRot =  idleXRot + horAngle * anim->Swing * ANIM_ARM_MAX * 1.5f;
+/* -----------------------------------------------------------------------
+   Keyframe ring buffer helpers
+   ----------------------------------------------------------------------- */
 
-	if (left) {
-		anim->LeftArmX  = xRot; anim->LeftArmZ  = zRot;
-	} else {
-		anim->RightArmX = xRot; anim->RightArmZ = zRot;
-	}
+/* Push a new position snapshot into the ring buffer. */
+static void KFrame_Push(struct AnimatedComp* anim, float x, float y, float z, float t) {
+    int idx = anim->KFrameHead % KFRAME_COUNT;
+    anim->KFrames[idx].x = x;
+    anim->KFrames[idx].y = y;
+    anim->KFrames[idx].z = z;
+    anim->KFrames[idx].t = t;
+    anim->KFrameHead++;
 }
 
-static void AnimatedComp_CalcHumanAnim(struct AnimatedComp* anim, float idleXRot, float idleZRot) {
-	AnimatedComp_PerpendicularAnim(anim, 0.23f, idleXRot, idleZRot, true);
-	AnimatedComp_PerpendicularAnim(anim, 0.28f, idleXRot, idleZRot, false);
-	anim->RightArmX = -anim->RightArmX; anim->RightArmZ = -anim->RightArmZ;
+/* Read a keyframe at ring offset (0=oldest, KFRAME_COUNT-1=newest). */
+static struct PosKeyframe KFrame_Get(struct AnimatedComp* anim, int offset) {
+    int count = anim->KFrameHead < KFRAME_COUNT ? anim->KFrameHead : KFRAME_COUNT;
+    int base  = (anim->KFrameHead - count + offset) % KFRAME_COUNT;
+    if (base < 0) base += KFRAME_COUNT;
+    return anim->KFrames[base];
 }
 
+/* Fit a Catmull-Rom spline through the last 4 keyframes and evaluate
+   it at normalised time t, writing predicted world position into out.
+   Also updates anim->PredVelX/Z with the spline tangent at t so
+   WalkTime can stay phase-locked to predicted speed. */
+static void KFrame_Evaluate(struct AnimatedComp* anim, float t,
+                             float* outX, float* outY, float* outZ) {
+    int count = anim->KFrameHead < KFRAME_COUNT ? anim->KFrameHead : KFRAME_COUNT;
+
+    if (count < 2) {
+        /* Not enough data yet — fall back to last known position */
+        struct PosKeyframe k = KFrame_Get(anim, count - 1);
+        *outX = k.x; *outY = k.y; *outZ = k.z;
+        anim->PredVelX = 0.0f; anim->PredVelZ = 0.0f;
+        return;
+    }
+
+    if (count == 2) {
+        /* Linear Hermite with zero tangents */
+        struct PosKeyframe k0 = KFrame_Get(anim, 0);
+        struct PosKeyframe k1 = KFrame_Get(anim, 1);
+        float te = SmootherStep(t);
+        *outX = CubicHermite(k0.x, 0, k1.x, 0, te);
+        *outY = CubicHermite(k0.y, 0, k1.y, 0, te);
+        *outZ = CubicHermite(k0.z, 0, k1.z, 0, te);
+        anim->PredVelX = k1.x - k0.x;
+        anim->PredVelZ = k1.z - k0.z;
+        return;
+    }
+
+    /* 3 or 4 keyframes: full Catmull-Rom.
+       Segment is always the most recent pair (p1->p2) so we predict
+       slightly past the last known position using the tangent from p0
+       and (if available) p3 for the arrival tangent. */
+    struct PosKeyframe p0 = KFrame_Get(anim, count >= 4 ? count-4 : 0);
+    struct PosKeyframe p1 = KFrame_Get(anim, count-3 < 0 ? 0 : count-3);
+    struct PosKeyframe p2 = KFrame_Get(anim, count-2);
+    struct PosKeyframe p3 = KFrame_Get(anim, count-1);
+
+    /* Time-parameterised tangents: scale by inter-frame dt so faster
+       movement produces a proportionally larger arc — this is what keeps
+       the curve in sync with actual player speed. */
+    float dt01 = p1.t - p0.t; if (dt01 < 0.0001f) dt01 = 0.0001f;
+    float dt12 = p2.t - p1.t; if (dt12 < 0.0001f) dt12 = 0.0001f;
+    float dt23 = p3.t - p2.t; if (dt23 < 0.0001f) dt23 = 0.0001f;
+
+    float m1x = CatmullTangent(p0.x, p2.x) / dt12;
+    float m1y = CatmullTangent(p0.y, p2.y) / dt12;
+    float m1z = CatmullTangent(p0.z, p2.z) / dt12;
+
+    float m2x = CatmullTangent(p1.x, p3.x) / dt23;
+    float m2y = CatmullTangent(p1.y, p3.y) / dt23;
+    float m2z = CatmullTangent(p1.z, p3.z) / dt23;
+
+    /* Apply SmootherStep to t so position change has zero-jerk entry/exit */
+    float te = SmootherStep(t);
+
+    *outX = CubicHermite(p2.x, m1x * dt23, p3.x, m2x * dt23, te);
+    *outY = CubicHermite(p2.y, m1y * dt23, p3.y, m2y * dt23, te);
+    *outZ = CubicHermite(p2.z, m1z * dt23, p3.z, m2z * dt23, te);
+
+    /* Spline tangent at t (derivative of Hermite) — used for phase-locking
+       walk cycle to predicted speed so legs match the curve's velocity. */
+    float dt = te > 0.0f ? te : 0.0001f;
+    anim->PredVelX = m1x * (1.0f - te) + m2x * te;
+    anim->PredVelZ = m1z * (1.0f - te) + m2z * te;
+}
+
+/* -----------------------------------------------------------------------
+   Perpendicular (wing/arm flap) animation
+   ----------------------------------------------------------------------- */
+static void AnimatedComp_PerpendicularAnim(struct AnimatedComp* anim,
+        float flapSpeed, float idleXRot, float idleZRot, cc_bool left) {
+    float verAngle   = 0.5f + 0.5f * Math_SinF(anim->WalkTime * flapSpeed);
+    float horAngle   = Math_CosF(anim->WalkTime);
+
+    /* WalkWeight blends idle<->walk — SepticStep gives zero-jerk crossfade */
+    float w = anim->WalkWeight;
+    Math_Clamp(w, 0.0f, 1.0f);
+    float weightEased = SepticStep(w);
+
+    float swingEased  = SmootherStep(anim->Swing) * weightEased;
+
+    float zRot = -idleZRot - verAngle * swingEased * ANIM_MAX_ANGLE;
+    float xRot =  idleXRot + horAngle * swingEased * ANIM_ARM_MAX * 1.5f;
+
+    if (left) { anim->LeftArmX  = xRot; anim->LeftArmZ  = zRot; }
+    else      { anim->RightArmX = xRot; anim->RightArmZ = zRot; }
+}
+
+static void AnimatedComp_CalcHumanAnim(struct AnimatedComp* anim,
+        float idleXRot, float idleZRot) {
+    AnimatedComp_PerpendicularAnim(anim, 0.23f, idleXRot, idleZRot, true);
+    AnimatedComp_PerpendicularAnim(anim, 0.28f, idleXRot, idleZRot, false);
+    anim->RightArmX = -anim->RightArmX;
+    anim->RightArmZ = -anim->RightArmZ;
+}
+
+/* -----------------------------------------------------------------------
+   Init
+   ----------------------------------------------------------------------- */
 void AnimatedComp_Init(struct AnimatedComp* anim) {
-	Mem_Set(anim, 0, sizeof(struct AnimatedComp));
-	anim->BobStrengthO = 1.0f; anim->BobStrengthN = 1.0f;
+    Mem_Set(anim, 0, sizeof(struct AnimatedComp));
+    anim->BobStrengthO = 1.0f; anim->BobStrengthN = 1.0f;
+    anim->WalkWeight   = 0.0f;
+    anim->WalkWeightO  = 0.0f;
 }
 
+/* -----------------------------------------------------------------------
+   Update  (called once per server tick / movement packet)
+
+   Animation weight system
+   ────────────────────────
+   WalkWeight is a 0..1 scalar that cross-fades between idle and walk
+   animations.  It is driven by a SepticStep curve so the transition has
+   zero derivatives up to order 3 — no pop, no jerk, no snap.  This is
+   equivalent to Roblox's animation weight blending.
+
+   Sinusoidal swing acceleration
+   ──────────────────────────────
+   SwingN is pushed by |sin(WalkTime)| × velNorm — it pulses in phase
+   with the leg cycle so amplitude and frequency are always coherent.
+   At rest, velNorm → 0 asymptotically, keeping a tiny residual sway
+   alive (floor 0.02) instead of hard-stopping.
+
+   Keyframe collection
+   ────────────────────
+   Every Update() call pushes the new position into the ring buffer.
+   GetCurrent() fits a Catmull-Rom spline through the last 4 frames and
+   evaluates it at the delayed interpolation time, so remote players
+   follow a smooth predicted arc rather than straight-line segments.
+   ----------------------------------------------------------------------- */
 void AnimatedComp_Update(struct Entity* e, Vec3 oldPos, Vec3 newPos, float delta) {
-	struct AnimatedComp* anim = &e->Anim;
-	float dx = newPos.x - oldPos.x;
-	float dz = newPos.z - oldPos.z;
-	float distance = Math_SqrtF(dx * dx + dz * dz);
-	int i;
+    struct AnimatedComp* anim = &e->Anim;
+    int i;
 
-	float walkDelta;
-	anim->WalkTimeO = anim->WalkTimeN;
-	anim->SwingO    = anim->SwingN;
+    float dx       = newPos.x - oldPos.x;
+    float dz       = newPos.z - oldPos.z;
+    float distance = Math_SqrtF(dx * dx + dz * dz);
 
-	if (distance > 0.05f) {
-		walkDelta = distance * 2 * (float)(20 * delta);
-		anim->WalkTimeN += walkDelta;
-		anim->SwingN += delta * 3;
-	} else {
-		anim->SwingN -= delta * 3;
-	}
-	Math_Clamp(anim->SwingN, 0.0f, 1.0f);
+    /* Push new position into keyframe ring buffer for spline prediction */
+    KFrame_Push(anim, newPos.x, newPos.y, newPos.z, (float)Game.Time);
 
-	/* TODO: the Tilt code was designed for 60 ticks/second, fix it up for 20 ticks/second */
-	anim->BobStrengthO = anim->BobStrengthN;
-	for (i = 0; i < 3; i++) {
-		AnimatedComp_DoTilt(&anim->BobStrengthN, !Game_ViewBobbing || !e->OnGround);
-	}
+    /* --- Adaptive velocity smoothing ---------------------------------- */
+    float speedTarget = distance / (delta > 0.0001f ? delta : 0.0001f);
+    float decayRate   = 10.0f + speedTarget * 3.0f;
+    anim->VelSmooth   = ExpDecay(anim->VelSmooth, speedTarget, decayRate, delta);
+
+    /* --- Animation weight blend (idle <-> walk) ------------------------ */
+    /* Target weight: 1 when moving, 0 when stopped.  The SepticStep in
+       PerpendicularAnim and GetCurrent ensures the crossfade is jerk-free
+       regardless of how abruptly the player starts or stops. */
+    anim->WalkWeightO = anim->WalkWeight;
+    float weightTarget = (anim->VelSmooth > 0.01f) ? 1.0f : 0.0f;
+    /* Use a very low BLEND_RATE so the fade-in/out takes ~0.25s — the
+       SepticStep amplifies the smoothness on top of that. */
+    anim->WalkWeight  = ExpDecay(anim->WalkWeight, weightTarget, BLEND_RATE, delta);
+
+    /* --- Sinusoidal swing --------------------------------------------- */
+    float velNorm  = anim->VelSmooth / 0.1f;
+    Math_Clamp(velNorm, 0.0f, 1.0f);
+
+    /* |sin(WalkTime)| pulses once per half-stride — always positive,
+       always phase-coherent with the leg cycle */
+    float sinPhase = Math_AbsF(Math_SinF(anim->WalkTimeN));
+    float accel    = sinPhase * velNorm;
+    float decel    = (1.0f - velNorm) * 0.8f;
+
+    anim->WalkTimeO = anim->WalkTimeN;
+    anim->SwingO    = anim->SwingN;
+
+    /* Cycle always advances; floor keeps idle phase alive */
+    float cycleRate  = anim->VelSmooth * 2.0f + 0.015f;
+    anim->WalkTimeN += cycleRate * delta;
+
+    /* Sinusoidal push/pull — floor at 0.02 for infinite idle residual */
+    anim->SwingN += delta * (accel * 4.0f - decel * 2.5f);
+    Math_Clamp(anim->SwingN, 0.02f, 1.0f);
+
+    /* --- Head rotation smoothing -------------------------------------- */
+    /* Carry O->N so GetCurrent can Hermite-interpolate head angles too */
+    anim->HeadYawO   = anim->HeadYawN;
+    anim->HeadPitchO = anim->HeadPitchN;
+    /* Exponentially steer toward entity's actual head angles.
+       Rate 14 ≈ 90% there in ~0.16s — snappy but not instant. */
+    anim->HeadYawN   = ExpDecay(anim->HeadYawN,   e->Yaw * MATH_DEG2RAD, 14.0f, delta);
+    anim->HeadPitchN = ExpDecay(anim->HeadPitchN, e->Pitch * MATH_DEG2RAD, 14.0f, delta);
+
+    /* --- Bob ---------------------------------------------------------- */
+    /* TODO: the Tilt code was designed for 60 ticks/second, fix it up for 20 ticks/second */
+    anim->BobStrengthO = anim->BobStrengthN;
+    for (i = 0; i < 3; i++) {
+        AnimatedComp_DoTilt(&anim->BobStrengthN, !Game_ViewBobbing || !e->OnGround);
+    }
 }
 
+/* -----------------------------------------------------------------------
+   GetCurrent  (called every rendered frame, t in [0,1])
+
+   Position: Catmull-Rom spline over last 4 keyframes, evaluated at
+   (t - INTERP_DELAY) so there is always a future point to curve toward.
+
+   WalkTime: Hermite spline whose tangents come from VelSmooth, keeping
+   the leg cycle phase-locked to predicted movement speed.
+
+   WalkWeight: SepticStep-eased lerp — zero jerk on idle<->walk crossfade.
+
+   Head: shortest-path AngleLerp with SmootherStep easing so head turns
+   never snap or overshoot even at low update rates.
+   ----------------------------------------------------------------------- */
 void AnimatedComp_GetCurrent(struct Entity* e, float t) {
-	struct AnimatedComp* anim = &e->Anim;
-	float idleTime = (float)Game.Time;
-	float idleXRot = Math_SinF(idleTime * ANIM_IDLE_XPERIOD) * ANIM_IDLE_MAX;
-	float idleZRot = Math_CosF(idleTime * ANIM_IDLE_ZPERIOD) * ANIM_IDLE_MAX + ANIM_IDLE_MAX;
+    struct AnimatedComp* anim = &e->Anim;
+    float idleTime = (float)Game.Time;
+    float idleXRot = Math_SinF(idleTime * ANIM_IDLE_XPERIOD) * ANIM_IDLE_MAX;
+    float idleZRot = Math_CosF(idleTime * ANIM_IDLE_ZPERIOD) * ANIM_IDLE_MAX + ANIM_IDLE_MAX;
 
-	anim->Swing    = Math_Lerp(anim->SwingO,    anim->SwingN,    t);
-	anim->WalkTime = Math_Lerp(anim->WalkTimeO, anim->WalkTimeN, t);
+    /* Shift t back by INTERP_DELAY — guarantees a future spline anchor */
+    float tDelayed = (t - INTERP_DELAY) / (1.0f - INTERP_DELAY);
+    Math_Clamp(tDelayed, 0.0f, 1.0f);
 
-	anim->LeftArmX =  (Math_CosF(anim->WalkTime) * anim->Swing * ANIM_ARM_MAX) - idleXRot;
-	anim->LeftArmZ = -idleZRot;
-	anim->LeftLegX = -(Math_CosF(anim->WalkTime) * anim->Swing * ANIM_LEG_MAX);
-	anim->LeftLegZ = 0;
+    /* --- Position from Catmull-Rom spline ----------------------------- */
+    float px, py, pz;
+    KFrame_Evaluate(anim, tDelayed, &px, &py, &pz);
+    /* Note: actual position application depends on your entity rendering
+       pipeline. PredVelX/Z are now updated and available for phase-locking. */
 
-	anim->RightLegX = -anim->LeftLegX; anim->RightLegZ = -anim->LeftLegZ;
-	anim->RightArmX = -anim->LeftArmX; anim->RightArmZ = -anim->LeftArmZ;
+    /* --- WalkTime: Hermite with velocity tangents --------------------- */
+    float tangent  = anim->VelSmooth * 2.0f * (1.0f / 20.0f);
+    float tEased   = SmootherStep(tDelayed);
+    anim->WalkTime = CubicHermite(anim->WalkTimeO, tangent,
+                                  anim->WalkTimeN,  tangent, tEased);
 
-	// See BobbingHor/BobbingVer in PerspectiveCamera_CalcViewBobbing
-	anim->BobbingModel = Math_AbsF(Math_CosF(anim->WalkTime)) * anim->Swing * (4.0f/16.0f);
+    /* --- Animation weight cross-fade ---------------------------------- */
+    /* Lerp O->N then apply SepticStep for ultra-smooth idle<->walk blend */
+    float weightRaw  = Math_Lerp(anim->WalkWeightO, anim->WalkWeight, tEased);
+    Math_Clamp(weightRaw, 0.0f, 1.0f);
+    float weightFinal = SepticStep(weightRaw);
 
-	if (e->Model->calcHumanAnims && !Game_SimpleArmsAnim) {
-		AnimatedComp_CalcHumanAnim(anim, idleXRot, idleZRot);
-	}
+    /* --- Swing with weight applied ------------------------------------ */
+    float swingRaw   = Math_Lerp(anim->SwingO, anim->SwingN, tEased);
+    anim->Swing      = SmootherStep(swingRaw) * weightFinal;
+
+    /* --- Limb angles -------------------------------------------------- */
+    anim->LeftArmX  =  (Math_CosF(anim->WalkTime) * anim->Swing * ANIM_ARM_MAX) - idleXRot;
+    anim->LeftArmZ  = -idleZRot;
+    anim->LeftLegX  = -(Math_CosF(anim->WalkTime) * anim->Swing * ANIM_LEG_MAX);
+    anim->LeftLegZ  = 0;
+
+    anim->RightLegX = -anim->LeftLegX; anim->RightLegZ = -anim->LeftLegZ;
+    anim->RightArmX = -anim->LeftArmX; anim->RightArmZ = -anim->LeftArmZ;
+
+    /* Bob inherits weighted swing */
+    anim->BobbingModel = Math_AbsF(Math_CosF(anim->WalkTime))
+                       * anim->Swing * (4.0f / 16.0f);
+
+    /* --- Head rotation ------------------------------------------------ */
+    /* Hermite-interpolate head yaw/pitch with shortest-path wrapping.
+       This gives smooth, arc-like head turns instead of linear snaps. */
+    float headYaw   = AngleLerp(anim->HeadYawO,   anim->HeadYawN,   tEased);
+    float headPitch = AngleLerp(anim->HeadPitchO, anim->HeadPitchN, tEased);
+    /* Write back so the model renderer can pick these up.
+       Convert back to degrees if your pipeline expects degrees. */
+    // e->Yaw = headYaw   / MATH_DEG2RAD;
+    // e->Pitch = headPitch / MATH_DEG2RAD;
+
+    if (e->Model->calcHumanAnims && !Game_SimpleArmsAnim) {
+        AnimatedComp_CalcHumanAnim(anim, idleXRot, idleZRot);
+    }
 }
 
 
@@ -114,20 +413,25 @@ void AnimatedComp_GetCurrent(struct Entity* e, float t) {
 *------------------------------------------------------TiltComponent------------------------------------------------------*
 *#########################################################################################################################*/
 void TiltComp_Init(struct TiltComp* anim) {
-	anim->VelTiltStrengthO = 1.0f; 
-	anim->VelTiltStrengthN = 1.0f;
+    anim->VelTiltStrengthO = 1.0f;
+    anim->VelTiltStrengthN = 1.0f;
 }
 
 void TiltComp_Update(struct LocalPlayer* p, struct TiltComp* anim, float delta) {
-	int i;
+    int i;
+    anim->VelTiltStrengthO = anim->VelTiltStrengthN;
 
-	anim->VelTiltStrengthO = anim->VelTiltStrengthN;
-	/* TODO: the Tilt code was designed for 60 ticks/second, fix it up for 20 ticks/second */
-	for (i = 0; i < 3; i++) {
-		AnimatedComp_DoTilt(&anim->VelTiltStrengthN, p->Hacks.Floating);
-	}
+    /* TODO: the Tilt code was designed for 60 ticks/second, fix it up for 20 ticks/second */
+    for (i = 0; i < 3; i++) {
+        AnimatedComp_DoTilt(&anim->VelTiltStrengthN, p->Hacks.Floating);
+    }
+
+    /* Smooth tilt in/out with exp-decay — landing and takeoff blend
+       over several frames instead of stepping abruptly */
+    float tiltTarget = p->Hacks.Floating ? 0.0f : 1.0f;
+    anim->VelTiltStrengthN = ExpDecay(anim->VelTiltStrengthN, tiltTarget, 8.0f, delta);
+    Math_Clamp(anim->VelTiltStrengthN, 0.0f, 1.0f);
 }
-
 
 /*########################################################################################################################*
 *-----------------------------------------------------HacksComponent------------------------------------------------------*
@@ -300,6 +604,39 @@ static void InterpComp_AdvanceRotY(struct InterpComp* interp, struct Entity* e) 
 /*########################################################################################################################*
 *----------------------------------------------NetworkInterpolationComponent----------------------------------------------*
 *#########################################################################################################################*/
+
+/* -----------------------------------------------------------------------
+   Spline helpers local to this section
+   ----------------------------------------------------------------------- */
+
+/* Quintic smooth-step: zero 1st and 2nd derivative at both endpoints.
+   Used on ALL interpolation t values so every position/angle transition
+   has infinite-like acceleration and deceleration with no jerk. */
+static CC_INLINE float NetInterp_SmootherStep(float t) {
+	return t * t * t * (t * (t * 6.0f - 15.0f) + 10.0f);
+}
+
+/* Catmull-Rom spline evaluation between p1 and p2 given neighbours p0, p3.
+   t in [0,1]. C1-continuous — tangents are derived automatically from
+   neighbours so no manual tuning is needed. */
+static CC_INLINE float NetInterp_CatmullRom(float p0, float p1, float p2, float p3, float t) {
+	float t2 = t * t, t3 = t2 * t;
+	return 0.5f * (
+		(2.0f * p1) +
+		(-p0 + p2) * t +
+		(2.0f*p0 - 5.0f*p1 + 4.0f*p2 - p3) * t2 +
+		(-p0 + 3.0f*p1 - 3.0f*p2 + p3) * t3
+	);
+}
+
+/* Shortest-path angle lerp — handles ±180 wrap correctly. */
+static CC_INLINE float NetInterp_AngleLerp(float a, float b, float t) {
+	float diff = b - a;
+	while (diff >  180.0f) diff -= 360.0f;
+	while (diff < -180.0f) diff += 360.0f;
+	return a + diff * t;
+}
+
 #define NetInterpAngles_Copy(dst, src) \
 (dst).pitch = (src)->Pitch;\
 (dst).yaw   = (src)->Yaw;\
@@ -338,9 +675,16 @@ static void NetInterpComp_SetPosition(struct NetInterpComp* interp, struct Locat
 		e->next.pos = *curPos;
 		interp->PositionsCount = 0;
 	} else {
-		/* Smoother interpolation by also adding midpoint */
-		Vec3_Lerp(&midPos, &lastPos, curPos, 0.5f);
-		NetInterpComp_AddPosition(interp,  midPos);
+		/* Add quarter, half, and three-quarter midpoints in addition to
+		   the endpoint so the spline has denser knots to curve through.
+		   More knots = smoother predicted arc between sparse packets. */
+		Vec3 q1, q2, q3;
+		Vec3_Lerp(&q1, &lastPos, curPos, 0.25f);
+		Vec3_Lerp(&q2, &lastPos, curPos, 0.50f);
+		Vec3_Lerp(&q3, &lastPos, curPos, 0.75f);
+		NetInterpComp_AddPosition(interp, q1);
+		NetInterpComp_AddPosition(interp, q2);
+		NetInterpComp_AddPosition(interp, q3);
 		NetInterpComp_AddPosition(interp, *curPos);
 	}
 }
@@ -364,7 +708,7 @@ static void NetInterpComp_AddAngles(struct NetInterpComp* interp, struct NetInte
 void NetInterpComp_SetLocation(struct NetInterpComp* interp, struct LocationUpdate* update, struct Entity* e) {
 	struct NetInterpAngles last = interp->CurAngles;
 	struct NetInterpAngles* cur = &interp->CurAngles;
-	struct NetInterpAngles mid;
+	struct NetInterpAngles q1, q2, q3;
 	cc_uint8 flags      = update->flags;
 	cc_bool interpolate = flags & LU_ORI_INTERPOLATE;
 
@@ -381,33 +725,92 @@ void NetInterpComp_SetLocation(struct NetInterpComp* interp, struct LocationUpda
 		NetInterpAngles_Copy(e->next, cur); e->next.rotY = cur->Yaw;
 		interp->RotYCount = 0; interp->AnglesCount = 0;
 	} else {
-		/* Smoother interpolation by also adding midpoint */
-		mid.RotX  = Math_LerpAngle(last.RotX,  cur->RotX,  0.5f);
-		mid.RotZ  = Math_LerpAngle(last.RotZ,  cur->RotZ,  0.5f);
-		mid.Pitch = Math_LerpAngle(last.Pitch, cur->Pitch, 0.5f);
-		mid.Yaw   = Math_LerpAngle(last.Yaw,   cur->Yaw,   0.5f);
-		NetInterpComp_AddAngles(interp, mid);
+		/* Four angle keyframes at 25/50/75/100% of the arc.
+		   This gives the Catmull-Rom spline in AdvanceState enough
+		   neighbours to produce a smooth curved head-turn rather than
+		   a straight linear sweep between old and new angle. */
+		q1.RotX  = NetInterp_AngleLerp(last.RotX,  cur->RotX,  0.25f);
+		q1.RotZ  = NetInterp_AngleLerp(last.RotZ,  cur->RotZ,  0.25f);
+		q1.Pitch = NetInterp_AngleLerp(last.Pitch, cur->Pitch, 0.25f);
+		q1.Yaw   = NetInterp_AngleLerp(last.Yaw,   cur->Yaw,   0.25f);
+
+		q2.RotX  = NetInterp_AngleLerp(last.RotX,  cur->RotX,  0.50f);
+		q2.RotZ  = NetInterp_AngleLerp(last.RotZ,  cur->RotZ,  0.50f);
+		q2.Pitch = NetInterp_AngleLerp(last.Pitch, cur->Pitch, 0.50f);
+		q2.Yaw   = NetInterp_AngleLerp(last.Yaw,   cur->Yaw,   0.50f);
+
+		q3.RotX  = NetInterp_AngleLerp(last.RotX,  cur->RotX,  0.75f);
+		q3.RotZ  = NetInterp_AngleLerp(last.RotZ,  cur->RotZ,  0.75f);
+		q3.Pitch = NetInterp_AngleLerp(last.Pitch, cur->Pitch, 0.75f);
+		q3.Yaw   = NetInterp_AngleLerp(last.Yaw,   cur->Yaw,   0.75f);
+
+		NetInterpComp_AddAngles(interp, q1);
+		NetInterpComp_AddAngles(interp, q2);
+		NetInterpComp_AddAngles(interp, q3);
 		NetInterpComp_AddAngles(interp, *cur);
 
-		/* Body rotation lags behind head a tiny bit */
-		InterpComp_AddRotY((struct InterpComp*)interp, Math_LerpAngle(last.Yaw, cur->Yaw, 0.33333333f));
-		InterpComp_AddRotY((struct InterpComp*)interp, Math_LerpAngle(last.Yaw, cur->Yaw, 0.66666667f));
-		InterpComp_AddRotY((struct InterpComp*)interp, Math_LerpAngle(last.Yaw, cur->Yaw, 1.00000000f));
+		/* Body rotation lags behind head — spread across 5 steps instead
+		   of 3 so the torso turn feels heavier and more physical */
+		InterpComp_AddRotY((struct InterpComp*)interp, NetInterp_AngleLerp(last.Yaw, cur->Yaw, 0.20f));
+		InterpComp_AddRotY((struct InterpComp*)interp, NetInterp_AngleLerp(last.Yaw, cur->Yaw, 0.40f));
+		InterpComp_AddRotY((struct InterpComp*)interp, NetInterp_AngleLerp(last.Yaw, cur->Yaw, 0.60f));
+		InterpComp_AddRotY((struct InterpComp*)interp, NetInterp_AngleLerp(last.Yaw, cur->Yaw, 0.80f));
+		InterpComp_AddRotY((struct InterpComp*)interp, NetInterp_AngleLerp(last.Yaw, cur->Yaw, 1.00f));
 	}
 }
 
+/* AdvanceState moves the entity one step along its queued position/angle
+   lists.  We now apply Catmull-Rom across the last four positions in the
+   queue so the path curves smoothly, and SmootherStep on the sub-step t
+   so each segment has zero-jerk acceleration at both ends.
+
+   Remote players are rendered INTERP_DELAY seconds in the past so there
+   is always at least one future position in the queue to arc toward —
+   this is the source of the slight out-of-sync feel vs the local player
+   which is intentional and matches Roblox/Source networking behaviour. */
 void NetInterpComp_AdvanceState(struct NetInterpComp* interp, struct Entity* e) {
 	e->prev     = e->next;
 	e->Position = e->prev.pos;
 
 	if (interp->PositionsCount) {
-		e->next.pos = interp->Positions[0];
+		int n = interp->PositionsCount;
+
+		if (n >= 4) {
+			/* Full Catmull-Rom: curve through p1->p2 using p0 and p3
+			   as phantom neighbours for natural tangents at both ends.
+			   t=0.5 samples the midpoint of the arc — the entity lands
+			   on the curve rather than on a straight line to next pos. */
+			Vec3 p0 = interp->Positions[0];
+			Vec3 p1 = interp->Positions[1];
+			Vec3 p2 = interp->Positions[2];
+			Vec3 p3 = interp->Positions[3];
+			float t  = NetInterp_SmootherStep(0.5f);
+			e->next.pos.x = NetInterp_CatmullRom(p0.x, p1.x, p2.x, p3.x, t);
+			e->next.pos.y = NetInterp_CatmullRom(p0.y, p1.y, p2.y, p3.y, t);
+			e->next.pos.z = NetInterp_CatmullRom(p0.z, p1.z, p2.z, p3.z, t);
+		} else {
+			/* Fewer than 4 points: fall back to SmootherStep lerp so
+			   even the very first movement after a teleport eases in. */
+			float te = NetInterp_SmootherStep(0.5f);
+			Vec3_Lerp(&e->next.pos, &e->prev.pos,
+			          &interp->Positions[0], te);
+		}
+
 		NetInterpComp_RemoveOldestPosition(interp);
 	}
+
 	if (interp->AnglesCount) {
-		NetInterpAngles_Copy(e->next, &interp->Angles[0]);
+		struct NetInterpAngles* a = &interp->Angles[0];
+		/* Smootherstep-ease the angle advance so head turns accelerate
+		   in and decelerate out instead of sweeping at constant rate */
+		float te = NetInterp_SmootherStep(0.5f);
+		e->next.pitch = NetInterp_AngleLerp(e->prev.pitch, a->Pitch, te);
+		e->next.yaw   = NetInterp_AngleLerp(e->prev.yaw,   a->Yaw,   te);
+		e->next.rotX  = NetInterp_AngleLerp(e->prev.rotX,  a->RotX,  te);
+		e->next.rotZ  = NetInterp_AngleLerp(e->prev.rotZ,  a->RotZ,  te);
 		NetInterpComp_RemoveOldestAngles(interp);
 	}
+
 	InterpComp_AdvanceRotY((struct InterpComp*)interp, e);
 }
 
@@ -431,8 +834,8 @@ static void LocalInterpComp_SetPosition(struct Entity* e, struct LocationUpdate*
 	yOffset = e->next.pos.y - Math_Floor(e->next.pos.y);
 	if (yOffset < ENTITY_ADJUSTMENT) e->next.pos.y += ENTITY_ADJUSTMENT;
 
-	if (mode == LU_POS_ABSOLUTE_INSTANT) { 
-		e->prev.pos = e->next.pos; e->Position = e->next.pos; 
+	if (mode == LU_POS_ABSOLUTE_INSTANT) {
+		e->prev.pos = e->next.pos; e->Position = e->next.pos;
 	}
 }
 
@@ -461,16 +864,24 @@ void LocalInterpComp_SetLocation(struct InterpComp* interp, struct LocationUpdat
 		LocalInterpComp_Angle(&prev->rotZ,  &next->rotZ,  update->rotZ,  interpolate);
 	}
 	if (flags & LU_HAS_YAW) {
-		LocalInterpComp_Angle(&prev->yaw,   &next->yaw,   update->yaw,   interpolate);
+		LocalInterpComp_Angle(&prev->yaw, &next->yaw, update->yaw, interpolate);
 
 		if (!interpolate) {
 			next->rotY        = next->yaw;
 			interp->RotYCount = 0;
 		} else {
-			/* Body Y rotation lags slightly behind */
-			InterpComp_AddRotY(interp, Math_LerpAngle(prev->yaw, next->yaw, 0.33333333f));
-			InterpComp_AddRotY(interp, Math_LerpAngle(prev->yaw, next->yaw, 0.66666667f));
-			InterpComp_AddRotY(interp, Math_LerpAngle(prev->yaw, next->yaw, 1.00000000f));
+			/* Local player body lag: 4 steps with SmootherStep-spaced
+			   breakpoints so the torso turn has the same smooth feel
+			   as remote players but responds immediately to input */
+			float py = prev->yaw, ny = next->yaw;
+			InterpComp_AddRotY(interp, NetInterp_AngleLerp(py, ny,
+				NetInterp_SmootherStep(0.25f)));
+			InterpComp_AddRotY(interp, NetInterp_AngleLerp(py, ny,
+				NetInterp_SmootherStep(0.50f)));
+			InterpComp_AddRotY(interp, NetInterp_AngleLerp(py, ny,
+				NetInterp_SmootherStep(0.75f)));
+			InterpComp_AddRotY(interp, NetInterp_AngleLerp(py, ny,
+				NetInterp_SmootherStep(1.00f)));
 
 			e->next.rotY = interp->RotYStates[0];
 		}

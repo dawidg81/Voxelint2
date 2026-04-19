@@ -13,13 +13,27 @@ struct LocationUpdate;
 struct LocalPlayer;
 
 /* Entity component that performs model animation depending on movement speed and time */
-struct AnimatedComp {
-	float BobbingModel;
-	float WalkTime, Swing;
-	float WalkTimeO, WalkTimeN, SwingO, SwingN, BobStrengthO, BobStrengthN;
+struct PosKeyframe {
+    float x, y, z;
+    float t;
+};
 
-	float LeftLegX, LeftLegZ, RightLegX, RightLegZ;
-	float LeftArmX, LeftArmZ, RightArmX, RightArmZ;
+struct AnimatedComp {
+    float BobbingModel;
+    float WalkTime, Swing;
+    float WalkTimeO, WalkTimeN, SwingO, SwingN, BobStrengthO, BobStrengthN;
+
+    float LeftLegX, LeftLegZ, RightLegX, RightLegZ;
+    float LeftArmX, LeftArmZ, RightArmX, RightArmZ;
+
+    /* --- smoothing extensions --- */
+    float VelSmooth;               /* exponentially smoothed speed (blk/s)     */
+    float WalkWeight, WalkWeightO; /* idle(0)<->walk(1) animation blend weight  */
+    float HeadYawO,   HeadYawN;    /* smoothed head yaw  (radians)              */
+    float HeadPitchO, HeadPitchN;  /* smoothed head pitch (radians)             */
+    float PredVelX,   PredVelZ;    /* spline tangent velocity for phase-locking */
+    struct PosKeyframe KFrames[4]; /* position history ring buffer (4 keyframes) */
+    int   KFrameHead;              /* ring buffer write index                   */
 };
 
 void AnimatedComp_Init(struct AnimatedComp* anim);
