@@ -74,13 +74,9 @@ static void SetMatrix(void) {
 
 static void ResetHeldState(void) {
 	/* Based off details from http://pastebin.com/KFV0HkmD (Thanks goodlyay!) */
-	struct Entity* p = &Entities.CurPlayer->Base;
+        struct Entity* p = &Entities.CurPlayer->Base;
 	Vec3 eye = { 0,0,0 }; eye.y = Entity_GetEyeHeight(p);
 	held_entity.Position = eye;
-
-	held_entity.Position.x -= Camera.BobbingHor;
-	held_entity.Position.y -= Camera.BobbingVer;
-	held_entity.Position.z -= Camera.BobbingHor;
 
 	held_entity.Yaw   = -45.0f; held_entity.RotY = -45.0f;
 	held_entity.Pitch = 0.0f;   held_entity.RotX = 0.0f;

@@ -111,6 +111,7 @@ struct NetInterpComp {
 	/* Interpolated position and orientation state */
 	int PositionsCount, AnglesCount;
 	Vec3 Positions[10]; struct NetInterpAngles Angles[10];
+  float VelX, VelY, VelZ;
 };
 
 void NetInterpComp_SetLocation(struct NetInterpComp* interp, struct LocationUpdate* update, struct Entity* e);

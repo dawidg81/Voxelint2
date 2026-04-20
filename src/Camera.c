@@ -141,14 +141,18 @@ static void PerspectiveCamera_CalcViewBobbing(struct LocalPlayer* p, float t, fl
 	float bobStrength, bobbingHor, bobbingVer;
 	float velTiltStrength;
 	
+	static float smoothFall0 = 0.0f;
+	static float smoothFall1 = 0.0f;
+	static float smoothFall2 = 0.0f;
+	
 	if (!Game_ViewBobbing) {
 		Camera.TiltM     = Matrix_Identity;
 		Camera.TiltPitch = 0.0f;
+		smoothFall0 = smoothFall1 = smoothFall2 = 0.0f;
 		return;
 	}
 	
 	bobStrength = Math_Lerp(e->Anim.BobStrengthO, e->Anim.BobStrengthN, t);
-	// See BobbingModel in AnimatedComp_GetCurrent
 	bobbingHor  = Math_CosF(e->Anim.WalkTime)            * e->Anim.Swing * (2.5f/16.0f);
 	bobbingVer  = Math_AbsF(Math_SinF(e->Anim.WalkTime)) * e->Anim.Swing * (2.5f/16.0f);
 
@@ -163,14 +167,24 @@ static void PerspectiveCamera_CalcViewBobbing(struct LocalPlayer* p, float t, fl
 	Camera.BobbingVer = (bobbingVer * 0.6f) * bobStrength;
 	velTiltStrength   = Math_Lerp(p->Tilt.VelTiltStrengthO, p->Tilt.VelTiltStrengthN, t);
 
-	/* When standing on the ground, velocity.y is -0.08 (-gravity) */
-	/* So add 0.08 to counteract that, so that vel is 0 when standing on ground */
 	vel  = 0.08f + Math_Lerp(p->OldVelocity.y, e->Velocity.y, t);
 	fall = -vel * 0.05f * velTiltStrength / velTiltScale;
 
-	Matrix_RotateX(&velX, fall);
+	if (!Game_ClassicMode) {
+		#define FALL_SMOOTH_RATE 5.0f
+		#define FALL_SMOOTH_STEP (FALL_SMOOTH_RATE * 0.016f * 1.4427f)
+		float alpha = 1.0f - Math_Exp2(-FALL_SMOOTH_STEP);
+		smoothFall0 += (fall        - smoothFall0) * alpha;
+		smoothFall1 += (smoothFall0 - smoothFall1) * alpha;
+		smoothFall2 += (smoothFall1 - smoothFall2) * alpha;
+
+		Matrix_RotateX(&velX, smoothFall2);
+		Camera.TiltPitch = smoothFall2;
+	} else {
+		Matrix_RotateX(&velX, fall);
+	}
+
 	Matrix_MulBy(&Camera.TiltM, &velX);
-	if (!Game_ClassicMode) Camera.TiltPitch = fall;
 }
 
 

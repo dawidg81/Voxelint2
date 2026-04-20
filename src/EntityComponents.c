@@ -294,82 +294,27 @@ static void InterpComp_AdvanceRotY(struct InterpComp* interp, struct Entity* e) 
 *----------------------------------------------NetworkInterpolationComponent----------------------------------------------*
 *#########################################################################################################################*/
 
-/*
- * Dynamic auto-Bézier interpolation
- * ==================================
- * Every position/angle update from the network is decomposed into a variable
- * number of keyframes whose count, spacing, and Bézier tension all depend on
- * the magnitude of the delta being interpolated.
- *
- * Position keyframes
- * ------------------
- *   dist = |newPos - oldPos|   (Euclidean, XYZ)
- *
- *   steps = clamp(round(dist / STEP_DIST_PER_FRAME), MIN_STEPS, MAX_STEPS)
- *
- *   Each keyframe is placed at a quintic smooth-step t-value so the baked
- *   positions already carry the ease-in/out shape.  AdvanceState then only
- *   needs to pop one frame per tick; no per-tick maths is required.
- *
- *   When ≥ 4 frames are queued in AdvanceState the front four are fitted to
- *   a cubic auto-Bézier (Catmull-Rom tangents → Bézier control points).
- *   The Bézier bow scales with the local chord length so short segments are
- *   nearly straight while long segments curve naturally.
- *
- * Angle keyframes
- * ---------------
- *   angDelta = largest of the four angle deltas (degrees, short-arc).
- *
- *   steps = clamp(round(angDelta / STEP_ANG_PER_FRAME), MIN_STEPS, MAX_STEPS)
- *
- *   Same quintic t-table approach; short turns resolve in 1-2 frames, large
- *   180° spins spread across MAX_STEPS frames so they never look robotic.
- *
- * Why this eliminates the stop/start jitter at long delays
- * ---------------------------------------------------------
- *   With a fixed step count a 2-block jump takes exactly as many frames as a
- *   2-pixel nudge, so the speed varies wildly between packets.  With dynamic
- *   steps the traversal speed (blocks/frame) is approximately constant across
- *   all packet sizes, making start/stop invisible even with 2-second delays.
- */
-
-/* One block in ClassiCube == 1.0 world unit.
-   Target: ≈ one frame covers this much distance at normal walk speed. */
 #define NETINTERP_STEP_DIST_PER_FRAME  0.12f
-
-/* Target: ≈ one frame covers this many degrees of rotation. */
 #define NETINTERP_STEP_ANG_PER_FRAME   6.0f
-
-/* Absolute bounds on keyframe count per transition. */
 #define NETINTERP_MIN_STEPS  2
-#define NETINTERP_MAX_STEPS  10   /* must be ≤ Positions[] / Angles[] capacity */
+#define NETINTERP_MAX_STEPS  10
 
-/* Quintic smooth-step: f(0)=0, f(1)=1, f'=f''=0 at both ends → zero jerk. */
+/* Velocity smoothing: how fast the entity accelerates toward target speed.
+   Higher = snappier response, lower = more gradual. Units: per second. */
+#define NETINTERP_VEL_ATTACK  6.0f
+#define NETINTERP_VEL_DECAY   3.0f
+
+/* How many queued frames is considered "normal" — used to scale speed.
+   If queue is deeper than this the entity speeds up slightly to catch up. */
+#define NETINTERP_QUEUE_IDEAL 3
+
+/* Maximum speed multiplier when queue is very deep (catching up). */
+#define NETINTERP_CATCHUP_MAX 2.0f
+
 static CC_INLINE float NetInterp_SmootherStep(float t) {
 	return t * t * t * (t * (t * 6.0f - 15.0f) + 10.0f);
 }
 
-/* Cubic Bézier: B(t) = (1-t)³P0 + 3(1-t)²tC1 + 3(1-t)t²C2 + t³P3 */
-static CC_INLINE float NetInterp_CubicBezier(float p0, float c1, float c2,
-		float p3, float t) {
-	float mt = 1.0f - t, mt2 = mt*mt, mt3 = mt2*mt;
-	float t2 = t*t, t3 = t2*t;
-	return mt3*p0 + 3.0f*mt2*t*c1 + 3.0f*mt*t2*c2 + t3*p3;
-}
-
-/* Derive auto-Bézier control points from Catmull-Rom neighbours.
-   Guarantees C1 continuity (matching velocity) at both segment endpoints.
-   tension ∈ [0,1] scales the bow: 0 = straight line, 1 = full Catmull-Rom. */
-static CC_INLINE void NetInterp_AutoBezierCP(
-		float pPrev, float p0, float p1, float pNext, float tension,
-		float* c0Out, float* c1Out) {
-	float t0 = 0.5f * (p1    - pPrev) * tension;
-	float t1 = 0.5f * (pNext - p0)   * tension;
-	*c0Out = p0 + t0 / 3.0f;
-	*c1Out = p1 - t1 / 3.0f;
-}
-
-/* Shortest-arc angle lerp — never spins the long way round. */
 static CC_INLINE float NetInterp_AngleLerp(float a, float b, float t) {
 	float diff = b - a;
 	while (diff >  180.0f) diff -= 360.0f;
@@ -377,7 +322,6 @@ static CC_INLINE float NetInterp_AngleLerp(float a, float b, float t) {
 	return a + diff * t;
 }
 
-/* Absolute shortest-arc delta in degrees. */
 static CC_INLINE float NetInterp_AngleDelta(float a, float b) {
 	float diff = b - a;
 	while (diff >  180.0f) diff -= 360.0f;
@@ -385,13 +329,14 @@ static CC_INLINE float NetInterp_AngleDelta(float a, float b) {
 	return diff < 0.0f ? -diff : diff;
 }
 
-/* Clamp an integer into [lo, hi]. */
 static CC_INLINE int NetInterp_ClampI(int v, int lo, int hi) {
 	return v < lo ? lo : (v > hi ? hi : v);
 }
 
-/* Compute the dynamic step count for a position transition.
-   More steps for longer moves, fewer for micro-corrections. */
+static CC_INLINE float NetInterp_ClampF(float v, float lo, float hi) {
+	return v < lo ? lo : (v > hi ? hi : v);
+}
+
 static int NetInterp_PosSteps(Vec3 from, Vec3 to) {
 	float dx   = to.x - from.x;
 	float dy   = to.y - from.y;
@@ -401,8 +346,6 @@ static int NetInterp_PosSteps(Vec3 from, Vec3 to) {
 	return NetInterp_ClampI(n, NETINTERP_MIN_STEPS, NETINTERP_MAX_STEPS);
 }
 
-/* Compute the dynamic step count for an angle transition.
-   Driven by the largest of the four angle deltas. */
 static int NetInterp_AngSteps(struct NetInterpAngles* last,
 		struct NetInterpAngles* cur) {
 	float d0 = NetInterp_AngleDelta(last->RotX,  cur->RotX);
@@ -413,7 +356,7 @@ static int NetInterp_AngSteps(struct NetInterpAngles* last,
 	if (d1 > mx) mx = d1;
 	if (d2 > mx) mx = d2;
 	if (d3 > mx) mx = d3;
-	int   n  = (int)(mx / NETINTERP_STEP_ANG_PER_FRAME + 0.5f);
+	int n = (int)(mx / NETINTERP_STEP_ANG_PER_FRAME + 0.5f);
 	return NetInterp_ClampI(n, NETINTERP_MIN_STEPS, NETINTERP_MAX_STEPS);
 }
 
@@ -451,19 +394,17 @@ static void NetInterpComp_SetPosition(struct NetInterpComp* interp,
 		e->prev.pos            = *curPos;
 		e->next.pos            = *curPos;
 		interp->PositionsCount = 0;
+		/* Reset velocity state on teleport */
+		interp->VelX = 0.0f; interp->VelY = 0.0f; interp->VelZ = 0.0f;
 		return;
 	}
 
-	/* Dynamic step count: proportional to move distance so traversal
-	   speed (units/frame) stays roughly constant across all packet sizes. */
 	steps = NetInterp_PosSteps(lastPos, *curPos);
 
-	/* Bake quintic smooth-step keyframes.
-	   Each frame sits on the ease curve so AdvanceState just pops one/tick. */
 	for (k = 0; k < steps; k++) {
 		Vec3  kf;
-		float raw = (float)(k + 1) / (float)steps;          /* 1/n … n/n  */
-		float st  = NetInterp_SmootherStep(raw);             /* ease curve  */
+		float raw = (float)(k + 1) / (float)steps;
+		float st  = NetInterp_SmootherStep(raw);
 		kf.x = lastPos.x + (curPos->x - lastPos.x) * st;
 		kf.y = lastPos.y + (curPos->y - lastPos.y) * st;
 		kf.z = lastPos.z + (curPos->z - lastPos.z) * st;
@@ -509,8 +450,6 @@ void NetInterpComp_SetLocation(struct NetInterpComp* interp,
 		return;
 	}
 
-	/* Dynamic step count: proportional to the largest angle delta so a 2°
-	   twitch resolves in 1-2 frames while a 180° spin spreads smoothly. */
 	steps = NetInterp_AngSteps(&last, cur);
 
 	for (k = 0; k < steps; k++) {
@@ -524,8 +463,6 @@ void NetInterpComp_SetLocation(struct NetInterpComp* interp,
 		NetInterpComp_AddAngles(interp, q);
 	}
 
-	/* Body rotY lags behind head: same step count and t-table so torso and
-	   head always finish turning on the same tick, no twist-then-snap. */
 	for (k = 0; k < steps; k++) {
 		float raw = (float)(k + 1) / (float)steps;
 		float st  = NetInterp_SmootherStep(raw);
@@ -535,58 +472,103 @@ void NetInterpComp_SetLocation(struct NetInterpComp* interp,
 }
 
 /*
- * AdvanceState — called once per game tick per remote player (hot path).
+ * AdvanceState — velocity-driven position with exponential smoothing.
  *
- * Positions: when ≥ 4 frames remain we fit a cubic auto-Bézier across the
- * four front keyframes.  The Bézier tension scales with the distance between
- * frames 1 and 2 (the current segment chord) relative to a reference speed,
- * so long-distance curves bow naturally while micro-nudges stay straight.
- * Quintic smooth-step applied to the sub-step t doubles the easing so there
- * is zero jerk at every segment junction.
+ * Instead of popping one keyframe per tick (which causes sprint/stop
+ * with high-latency servers), we maintain a smoothed velocity vector
+ * that accelerates toward the direction of the next queued keyframe.
  *
- * Angles: pre-baked with smooth-step t-values — consumed directly, no extra
- * easing needed (double-easing would over-smooth and add artificial lag).
+ * Each tick:
+ *   1. Compute target velocity = direction to next keyframe × base speed
+ *      scaled by a catchup factor proportional to queue depth.
+ *   2. Exponentially smooth current velocity toward target (attack/decay).
+ *   3. Move entity by current velocity.
+ *   4. If we reached or passed the next keyframe, consume it and continue
+ *      with any leftover movement toward the one after.
+ *
+ * Result: the entity always moves at a perceptually consistent speed.
+ * Deep queues cause gentle speedup; empty queue causes gentle slowdown
+ * to a stop — identical feel to the walk animation Swing blend.
  */
 void NetInterpComp_AdvanceState(struct NetInterpComp* interp, struct Entity* e) {
 	e->prev     = e->next;
 	e->Position = e->prev.pos;
 
 	if (interp->PositionsCount) {
-		int n = interp->PositionsCount;
+		Vec3  cur    = e->prev.pos;
+		Vec3* target = &interp->Positions[0];
+		float dx, dy, dz, dist, speed, catchup, tvelX, tvelY, tvelZ;
+		float alpha;
 
-		if (n >= 4) {
-			Vec3  p0 = interp->Positions[0];
-			Vec3  p1 = interp->Positions[1];
-			Vec3  p2 = interp->Positions[2];
-			Vec3  p3 = interp->Positions[3];
+		/* Distance to next keyframe */
+		dx   = target->x - cur.x;
+		dy   = target->y - cur.y;
+		dz   = target->z - cur.z;
+		dist = Math_SqrtF(dx*dx + dy*dy + dz*dz);
 
-			/* Tension: ratio of current segment length to the reference
-			   per-frame distance.  Short segments → low tension (straight);
-			   long segments → high tension (fully curved Catmull-Rom bow).
-			   Clamped to [0,1] so we never overshoot. */
-			float dx   = p2.x - p1.x, dy = p2.y - p1.y, dz = p2.z - p1.z;
-			float segLen  = Math_SqrtF(dx*dx + dy*dy + dz*dz);
-			float tension = segLen / NETINTERP_STEP_DIST_PER_FRAME;
-			if (tension > 1.0f) tension = 1.0f;
+		if (dist > 0.0001f) {
+			/* Base speed: one keyframe worth of distance per tick.
+			   Scale up gently when queue is deeper than ideal so the
+			   entity catches up without a visible lurch. */
+			catchup = 1.0f + ((float)(interp->PositionsCount - NETINTERP_QUEUE_IDEAL)
+			                  / (float)NETINTERP_QUEUE_IDEAL) * 0.5f;
+			catchup = NetInterp_ClampF(catchup, 0.5f, NETINTERP_CATCHUP_MAX);
 
-			float c1x, c1y, c1z, c2x, c2y, c2z;
-			NetInterp_AutoBezierCP(p0.x, p1.x, p2.x, p3.x, tension, &c1x, &c2x);
-			NetInterp_AutoBezierCP(p0.y, p1.y, p2.y, p3.y, tension, &c1y, &c2y);
-			NetInterp_AutoBezierCP(p0.z, p1.z, p2.z, p3.z, tension, &c1z, &c2z);
+			speed = NETINTERP_STEP_DIST_PER_FRAME * catchup;
 
-			/* Smooth-step the sub-step t: zero jerk at segment boundaries. */
-			float t = NetInterp_SmootherStep(0.5f);
-
-			e->next.pos.x = NetInterp_CubicBezier(p1.x, c1x, c2x, p2.x, t);
-			e->next.pos.y = NetInterp_CubicBezier(p1.y, c1y, c2y, p2.y, t);
-			e->next.pos.z = NetInterp_CubicBezier(p1.z, c1z, c2z, p2.z, t);
+			/* Target velocity: toward keyframe at smoothed speed */
+			tvelX = (dx / dist) * speed;
+			tvelY = (dy / dist) * speed;
+			tvelZ = (dz / dist) * speed;
 		} else {
-			/* Near the end of a segment: keyframe baking already carries
-			   the ease shape — consume directly. */
-			e->next.pos = interp->Positions[0];
+			/* Already at keyframe — consume and stop */
+			tvelX = 0.0f; tvelY = 0.0f; tvelZ = 0.0f;
 		}
 
-		NetInterpComp_RemoveOldestPosition(interp);
+		/* Exponential smoothing toward target velocity — attack when
+		   speeding up, decay when slowing down, same as Swing blend.
+		   alpha = 1 - exp2(-rate * INV_LN2) at 20 ticks/sec ≈ delta=0.05 */
+		alpha = 1.0f - Math_Exp2(-NETINTERP_VEL_ATTACK * 0.05f * INV_LN2);
+		interp->VelX += (tvelX - interp->VelX) * alpha;
+		interp->VelY += (tvelY - interp->VelY) * alpha;
+		interp->VelZ += (tvelZ - interp->VelZ) * alpha;
+
+		/* Apply velocity */
+		cur.x += interp->VelX;
+		cur.y += interp->VelY;
+		cur.z += interp->VelZ;
+
+		/* Check if we reached or overshot the keyframe */
+		dx = target->x - cur.x;
+		dy = target->y - cur.y;
+		dz = target->z - cur.z;
+		{
+			float remDist = Math_SqrtF(dx*dx + dy*dy + dz*dz);
+			/* Overshoot check: dot product of remaining delta with original
+			   delta — if negative we passed the target, snap and consume. */
+			float dot = dx*(target->x - e->prev.pos.x)
+			          + dy*(target->y - e->prev.pos.y)
+			          + dz*(target->z - e->prev.pos.z);
+
+			if (dot <= 0.0f || remDist < 0.001f) {
+				cur = *target;
+				NetInterpComp_RemoveOldestPosition(interp);
+				/* Inherit velocity so next frame continues smoothly */
+			}
+		}
+
+		e->next.pos = cur;
+	} else {
+		/* Queue empty: exponentially decay velocity to zero so the
+		   entity glides to a stop rather than snapping still. */
+		float alpha = 1.0f - Math_Exp2(-NETINTERP_VEL_DECAY * 0.05f * INV_LN2);
+		interp->VelX -= interp->VelX * alpha;
+		interp->VelY -= interp->VelY * alpha;
+		interp->VelZ -= interp->VelZ * alpha;
+
+		e->next.pos.x = e->prev.pos.x + interp->VelX;
+		e->next.pos.y = e->prev.pos.y + interp->VelY;
+		e->next.pos.z = e->prev.pos.z + interp->VelZ;
 	}
 
 	if (interp->AnglesCount) {
@@ -656,15 +638,12 @@ void LocalInterpComp_SetLocation(struct InterpComp* interp,
 			next->rotY        = next->yaw;
 			interp->RotYCount = 0;
 		} else {
-			/* Local player body lag: dynamic step count matches the angle
-			   delta so a tiny yaw correction resolves in 1-2 frames. */
 			float py = prev->yaw, ny = next->yaw;
 			float angDelta = NetInterp_AngleDelta(py, ny);
-			int steps = (int)(angDelta / NETINTERP_STEP_ANG_PER_FRAME + 0.5f);
-			int k;
-			steps = NetInterp_ClampI(steps,
+			int steps = NetInterp_ClampI(
+				(int)(angDelta / NETINTERP_STEP_ANG_PER_FRAME + 0.5f),
 				NETINTERP_MIN_STEPS, NETINTERP_MAX_STEPS);
-
+			int k;
 			for (k = 0; k < steps; k++) {
 				float raw = (float)(k + 1) / (float)steps;
 				float st  = NetInterp_SmootherStep(raw);
